@@ -124,18 +124,15 @@ class OverlayService : Service() {
     }
 
     private fun onNewText(original: String, hindi: String) {
-        // Show Hindi if available, fall back to source text so overlay is never blank
-        val displayText = when {
-            hindi.isNotBlank() -> hindi.trim()
-            original.isNotBlank() -> original.trim()  // fallback: show source while CT2 warms up
-            else -> return
-        }
+        // Only show Hindi translation — never show English/source language text
+        // If translation failed (hindi is blank), show nothing rather than English
+        if (hindi.isBlank()) return
 
         displayRunnable?.let { mainHandler.removeCallbacks(it) }
         silenceRunnable?.let { mainHandler.removeCallbacks(it) }
 
         srcTv?.text   = ""
-        hindiTv?.text = displayText
+        hindiTv?.text = hindi.trim()
 
         showOverlay()
         rescheduleSilence()
