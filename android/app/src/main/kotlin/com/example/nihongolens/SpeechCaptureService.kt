@@ -243,38 +243,46 @@ class SpeechCaptureService : Service() {
         }
         audioRecord = ar
         chunksSentThisSession.set(0)
-        lastPushedHindi = ""   // clear so previous session subtitle never re-shows
+        lastPushedHindi = ""
         audioQueue.clear()
+
+        // Reset server BEFORE starting capture — synchronous, 1s max.
+        // Localhost call completes in <50ms typically.
+        // Must complete before capture starts to ensure server queue is empty.
+        try {
+            val conn = URL("http://127.0.0.1:8765/reset").openConnection() as HttpURLConnection
+            conn.requestMethod  = "GET"
+            conn.connectTimeout = 1_000
+            conn.readTimeout    = 1_000
+            conn.responseCode
+            conn.disconnect()
+            Log.d(TAG, "Server reset complete")
+        } catch (e: Exception) {
+            Log.d(TAG, "Server reset failed: ${e.message}")
+        }
 
         capturing.set(true)
         ar.startRecording()
         updateNotification("Translating video audio to Hindi…")
 
-        // Clear any leftover subtitle from previous session immediately
-        mainHandler.post {
-            OverlayService.updateText("", "")
-        }
-
-        // Reset server language cache — prevents previous session's language
-        // from bleeding into this session
-        Thread({
-            try {
-                val conn = URL("http://127.0.0.1:8765/reset").openConnection() as HttpURLConnection
-                conn.requestMethod = "GET"
-                conn.connectTimeout = 2_000
-                conn.readTimeout    = 2_000
-                conn.responseCode   // trigger request
-                conn.disconnect()
-                Log.d(TAG, "Server session reset successful")
-            } catch (e: Exception) {
-                Log.d(TAG, "Server reset call failed (non-critical): ${e.message}")
-            }
-        }, "ResetThread").apply { isDaemon = true; start() }
+        mainHandler.post { OverlayService.updateText("", "") }
 
         captureThread = Thread({
-            val window  = ByteArray(CHUNK_BYTES)
-            var filled  = 0
-            val readBuf = ByteArray(4096)
+            // SLIDING WINDOW with 0.5s overlap
+            // Problem: 2s chunks cut randomly — words starting at 1.9s get split
+            // across two chunks. Whisper sees incomplete words → drops them.
+            // Fix: keep OVERLAP_BYTES (0.5s = 16000 samples × 2 bytes) from the
+            // end of each chunk and prepend to the next chunk.
+            // Each chunk sent = OVERLAP(0.5s) + NEW_AUDIO(2s) = 2.5s total.
+            // Whisper sees complete words at every boundary.
+            val OVERLAP_SAMPLES = (SAMPLE_RATE * 0.5).toInt()  // 8000 samples
+            val OVERLAP_BYTES   = OVERLAP_SAMPLES * 2           // 16000 bytes
+            val SEND_BYTES      = CHUNK_BYTES + OVERLAP_BYTES   // 2.5s total
+
+            val window   = ByteArray(SEND_BYTES)  // full send buffer
+            var filled   = OVERLAP_BYTES          // start after overlap region
+            val readBuf  = ByteArray(4096)
+            var firstChunk = true
 
             while (capturing.get() && !Thread.currentThread().isInterrupted) {
                 val rec  = audioRecord ?: break
@@ -285,24 +293,29 @@ class SpeechCaptureService : Service() {
 
                 var src = 0
                 while (src < read) {
-                    val toCopy = minOf(read - src, CHUNK_BYTES - filled)
+                    val toCopy = minOf(read - src, SEND_BYTES - filled)
                     System.arraycopy(readBuf, src, window, filled, toCopy)
                     filled += toCopy; src += toCopy
 
-                    if (filled >= CHUNK_BYTES) {
+                    if (filled >= SEND_BYTES) {
                         if (!reconnecting) {
-                            val wav     = pcmToWav(window.copyOf(CHUNK_BYTES))
-                            val stampMs = System.currentTimeMillis()
-                            val job     = AudioJob(wav, stampMs)
-
-                            // Bounded enqueue: drop oldest if full
-                            if (!audioQueue.offer(job)) {
-                                audioQueue.poll(); audioQueue.offer(job)
-                                Log.d(TAG, "Queue full — dropped oldest")
+                            if (firstChunk) {
+                                // First chunk has no overlap — send without prepend
+                                val wav = pcmToWav(window.copyOfRange(OVERLAP_BYTES, SEND_BYTES))
+                                firstChunk = false
+                                val job = AudioJob(wav, System.currentTimeMillis())
+                                if (!audioQueue.offer(job)) { audioQueue.poll(); audioQueue.offer(job) }
+                            } else {
+                                // Send full window including overlap from previous chunk
+                                val wav = pcmToWav(window.copyOf(SEND_BYTES))
+                                val job = AudioJob(wav, System.currentTimeMillis())
+                                if (!audioQueue.offer(job)) { audioQueue.poll(); audioQueue.offer(job) }
                             }
                             chunksSentThisSession.incrementAndGet()
                         }
-                        filled = 0
+                        // Keep last OVERLAP_BYTES for next chunk
+                        System.arraycopy(window, SEND_BYTES - OVERLAP_BYTES, window, 0, OVERLAP_BYTES)
+                        filled = OVERLAP_BYTES
                     }
                 }
             }
